@@ -11,8 +11,8 @@ $SCAN_FILE = Join-Path $PSScriptRoot "file_scanner.php"
 $COOKIE_JAR = Join-Path $env:TEMP "bx_cookies.txt"
 
 # Verify curl.exe is available
-$curlExe = (Get-Command "curl.exe" -ErrorAction SilentlyContinue)?.Source
-if (-not $curlExe) { $curlExe = "curl" }
+$curlCmd = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+$curlExe = if ($curlCmd) { $curlCmd.Source } else { "curl" }
 
 Write-Host "`n=== Bitrix File Scanner ===" -ForegroundColor Cyan
 Write-Host "Using: $curlExe" -ForegroundColor Gray
