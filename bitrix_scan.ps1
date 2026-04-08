@@ -10,8 +10,28 @@ $PASSWORD  = "M8U-PZB-m7x-Mrv"
 $SCAN_KEY  = "scan2024secure"
 $SCAN_FILE = Join-Path $PSScriptRoot "file_scanner.php"
 
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+# Force TLS 1.2 + 1.3 and ignore SSL errors (for self-signed certs)
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.SecurityProtocolType]::Tls12 -bor
+    [System.Net.SecurityProtocolType]::Tls11 -bor
+    [System.Net.SecurityProtocolType]::Tls
+)
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor
+        [System.Net.SecurityProtocolType]::Tls13
+} catch {}
+
+# Bypass SSL certificate validation
+Add-Type -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAll : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
+        WebRequest req, int problem) { return true; }
+}
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
 
 Write-Host "`n=== Bitrix File Scanner ===" -ForegroundColor Cyan
 
