@@ -15,7 +15,9 @@ if (empty($_GET['key']) || $_GET['key'] !== $ACCESS_KEY) {
 }
 
 set_time_limit(120);
-error_reporting(0);
+// Show errors so we can diagnose blank-page issues
+error_reporting(E_ALL);
+ini_set('display_errors', '1');
 
 $root = realpath(__DIR__);
 $output_format = isset($_GET['format']) && $_GET['format'] === 'json' ? 'json' : 'html';
@@ -134,10 +136,10 @@ function scan_dir(string $dir, string $root, int $depth = 0, int $max_depth = 4)
         $items[] = $item;
     }
 
-    // Сортировка: директории первыми, потом файлы
-    usort($items, fn($a, $b) =>
-        ($a['type'] === 'dir' ? 0 : 1) - ($b['type'] === 'dir' ? 0 : 1)
-    );
+    // Sort: directories first, then files (PHP 5.3+ compatible)
+    usort($items, function($a, $b) {
+        return ($a['type'] === 'dir' ? 0 : 1) - ($b['type'] === 'dir' ? 0 : 1);
+    });
 
     return $items;
 }
@@ -221,7 +223,7 @@ if ($output_format === 'json') {
 // HTML вывод
 // -----------------------------------------------------------------------
 
-function render_tree(array $items, int $level = 0): void
+function render_tree(array $items, int $level = 0)
 {
     foreach ($items as $item) {
         $indent  = str_repeat('&nbsp;&nbsp;&nbsp;&nbsp;', $level);

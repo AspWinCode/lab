@@ -7,7 +7,8 @@ $BASE_URL  = "https://lab-venera.ru"
 $LOGIN     = "admin"
 $PASSWORD  = "M8U-PZB-m7x-Mrv"
 $SCAN_KEY  = "scan2024secure"
-$SCAN_FILE = Join-Path $PSScriptRoot "file_scanner.php"
+$SCAN_FILE  = Join-Path $PSScriptRoot "file_scanner.php"
+$DEBUG_FILE = Join-Path $PSScriptRoot "bx_debug.php"
 $COOKIE_JAR = Join-Path $env:TEMP "bx_cookies.txt"
 
 # Verify curl.exe is available
@@ -86,29 +87,37 @@ if (-not (Test-Path $SCAN_FILE)) {
     exit 1
 }
 
-$uploadUri = "$BASE_URL/bitrix/admin/fileman_file_upload.php?action=upload&path=%2F&site_id=s1"
-
+$uploadUri      = "$BASE_URL/bitrix/admin/fileman_file_upload.php?action=upload&path=%2F&site_id=s1"
 $uploadRespFile = Join-Path $env:TEMP "bx_upload.html"
 
-$result = & $curlExe -sk `
-    --cookie $COOKIE_JAR `
-    --cookie-jar $COOKIE_JAR `
-    --form "action=upload" `
-    --form "path=/" `
-    --form "site_id=s1" `
-    --form "sessid=$sessid" `
-    --form "file=@$SCAN_FILE;type=application/octet-stream" `
-    --output $uploadRespFile `
-    --write-out "%{http_code}" `
-    $uploadUri
+function Upload-File($localPath, $remoteName) {
+    $result = & $curlExe -sk `
+        --cookie $COOKIE_JAR `
+        --cookie-jar $COOKIE_JAR `
+        --form "action=upload" `
+        --form "path=/" `
+        --form "site_id=s1" `
+        --form "sessid=$sessid" `
+        --form "file=@${localPath};filename=${remoteName};type=application/octet-stream" `
+        --output $uploadRespFile `
+        --write-out "%{http_code}" `
+        $uploadUri
+    return $result
+}
 
-if ($result -eq "200" -or $result -eq "302") {
-    Write-Host "    Uploaded. HTTP $result" -ForegroundColor Green
+$r = Upload-File $SCAN_FILE "file_scanner.php"
+if ($r -eq "200" -or $r -eq "302") {
+    Write-Host "    file_scanner.php uploaded. HTTP $r" -ForegroundColor Green
 } else {
-    Write-Host "    Upload HTTP $result - may need manual upload." -ForegroundColor Yellow
-    $uploadHtml = Get-Content $uploadRespFile -Raw -ErrorAction SilentlyContinue
-    if ($uploadHtml) { Write-Host "    Response: $($uploadHtml.Substring(0, [Math]::Min(300, $uploadHtml.Length)))" -ForegroundColor Gray }
-    Write-Host "    If upload failed - place file_scanner.php manually in site root via Bitrix file manager." -ForegroundColor Yellow
+    Write-Host "    Upload HTTP $r" -ForegroundColor Yellow
+}
+
+# Also upload debug script
+if (Test-Path $DEBUG_FILE) {
+    $r2 = Upload-File $DEBUG_FILE "bx_debug.php"
+    if ($r2 -eq "200" -or $r2 -eq "302") {
+        Write-Host "    bx_debug.php uploaded. HTTP $r2" -ForegroundColor Green
+    }
 }
 
 # -----------------------------------------------------------------------
@@ -137,6 +146,11 @@ if ($httpCode -ne "200") {
 
 # Open HTML version in browser
 Start-Process $scanUrl
+
+# Also open debug page if it was uploaded
+$debugUrl = "$BASE_URL/bx_debug.php?key=$SCAN_KEY"
+Write-Host "    Debug URL: $debugUrl" -ForegroundColor Gray
+Start-Process $debugUrl
 
 # Parse and display results
 try {
