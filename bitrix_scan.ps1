@@ -1,6 +1,5 @@
 # ============================================================
-# Bitrix File Scanner - PowerShell
-# Login to Bitrix, upload PHP scanner, run scan
+# Bitrix File Scanner - PowerShell (uses curl.exe)
 # Usage: .\bitrix_scan.ps1
 # ============================================================
 
@@ -9,178 +8,142 @@ $LOGIN     = "admin"
 $PASSWORD  = "M8U-PZB-m7x-Mrv"
 $SCAN_KEY  = "scan2024secure"
 $SCAN_FILE = Join-Path $PSScriptRoot "file_scanner.php"
+$COOKIE_JAR = Join-Path $env:TEMP "bx_cookies.txt"
 
-# Force TLS 1.2 + 1.3 and ignore SSL errors (for self-signed certs)
-[System.Net.ServicePointManager]::SecurityProtocol = (
-    [System.Net.SecurityProtocolType]::Tls12 -bor
-    [System.Net.SecurityProtocolType]::Tls11 -bor
-    [System.Net.SecurityProtocolType]::Tls
-)
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol =
-        [System.Net.ServicePointManager]::SecurityProtocol -bor
-        [System.Net.SecurityProtocolType]::Tls13
-} catch {}
-
-# Bypass SSL certificate validation
-Add-Type -TypeDefinition @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAll : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert,
-        WebRequest req, int problem) { return true; }
-}
-"@
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
+# Verify curl.exe is available
+$curlExe = (Get-Command "curl.exe" -ErrorAction SilentlyContinue)?.Source
+if (-not $curlExe) { $curlExe = "curl" }
 
 Write-Host "`n=== Bitrix File Scanner ===" -ForegroundColor Cyan
+Write-Host "Using: $curlExe" -ForegroundColor Gray
 
 # -----------------------------------------------------------------------
-# Step 1. Get login page (for sessid token)
+# Step 1. Get login page + collect cookies
 # -----------------------------------------------------------------------
 Write-Host "[1/4] Connecting to admin panel..." -ForegroundColor Yellow
 
-try {
-    $loginPage = Invoke-WebRequest `
-        -Uri "$BASE_URL/bitrix/admin/index.php" `
-        -SessionVariable sessionVar `
-        -UseBasicParsing `
-        -TimeoutSec 30
-} catch {
-    Write-Host "Connection error: $_" -ForegroundColor Red
+$loginPageFile = Join-Path $env:TEMP "bx_login.html"
+
+$result = & $curlExe -sk `
+    --cookie-jar $COOKIE_JAR `
+    --output $loginPageFile `
+    --write-out "%{http_code}" `
+    "$BASE_URL/bitrix/admin/index.php"
+
+if ($LASTEXITCODE -ne 0 -or $result -eq "000") {
+    Write-Host "Connection failed (curl exit: $LASTEXITCODE, HTTP: $result)" -ForegroundColor Red
+    Write-Host "Make sure curl.exe is available (Windows 10+ has it built-in)." -ForegroundColor Yellow
     exit 1
 }
+Write-Host "    HTTP $result - OK" -ForegroundColor Green
 
-$session = $sessionVar
-
-$sessidMatch = [regex]::Match($loginPage.Content, 'name="sessid"\s+value="([^"]+)"')
-$sessid = if ($sessidMatch.Success) { $sessidMatch.Groups[1].Value } else { "" }
+# Extract sessid from HTML
+$loginHtml = Get-Content $loginPageFile -Raw -ErrorAction SilentlyContinue
+$sessid = ""
+if ($loginHtml -match 'name="sessid"\s+value="([^"]+)"') {
+    $sessid = $Matches[1]
+    Write-Host "    sessid: $sessid" -ForegroundColor Gray
+}
 
 # -----------------------------------------------------------------------
-# Step 2. Authenticate
+# Step 2. Login
 # -----------------------------------------------------------------------
 Write-Host "[2/4] Logging in as $LOGIN..." -ForegroundColor Yellow
 
-$loginBody = @{
-    AUTH_FORM     = "Y"
-    TYPE          = "AUTH"
-    backurl       = "/bitrix/admin/"
-    USER_LOGIN    = $LOGIN
-    USER_PASSWORD = $PASSWORD
-    USER_REMEMBER = "N"
-}
-if ($sessid) { $loginBody["sessid"] = $sessid }
+$authRespFile = Join-Path $env:TEMP "bx_auth.html"
 
-try {
-    $authResp = Invoke-WebRequest `
-        -Uri "$BASE_URL/bitrix/admin/index.php" `
-        -Method POST `
-        -Body $loginBody `
-        -WebSession $session `
-        -UseBasicParsing `
-        -TimeoutSec 30
-} catch {
-    Write-Host "Auth error: $_" -ForegroundColor Red
+$postData = "AUTH_FORM=Y&TYPE=AUTH&backurl=%2Fbitrix%2Fadmin%2F" +
+            "&USER_LOGIN=$LOGIN&USER_PASSWORD=$PASSWORD&USER_REMEMBER=N"
+if ($sessid) { $postData += "&sessid=$sessid" }
+
+$result = & $curlExe -sk `
+    --cookie $COOKIE_JAR `
+    --cookie-jar $COOKIE_JAR `
+    --data $postData `
+    --output $authRespFile `
+    --write-out "%{http_code}" `
+    --location `
+    "$BASE_URL/bitrix/admin/index.php"
+
+$authHtml = Get-Content $authRespFile -Raw -ErrorAction SilentlyContinue
+
+if ($authHtml -match 'id="user_login"|name="USER_LOGIN"') {
+    Write-Host "Login failed - wrong credentials or Captcha required." -ForegroundColor Red
     exit 1
 }
+Write-Host "    Logged in. HTTP $result" -ForegroundColor Green
 
-if ($authResp.Content -match 'USER_LOGIN|id="user_login"') {
-    Write-Host "Login failed - check credentials." -ForegroundColor Red
-    exit 1
-}
-Write-Host "    Logged in successfully." -ForegroundColor Green
-
-$sessidMatch2 = [regex]::Match($authResp.Content, '"sessid":"([^"]+)"')
-if ($sessidMatch2.Success) { $sessid = $sessidMatch2.Groups[1].Value }
+# Refresh sessid from auth response
+if ($authHtml -match '"sessid":"([^"]+)"') { $sessid = $Matches[1] }
 
 # -----------------------------------------------------------------------
-# Step 3. Upload file_scanner.php via file manager
+# Step 3. Upload file_scanner.php
 # -----------------------------------------------------------------------
-Write-Host "[3/4] Uploading file_scanner.php to server..." -ForegroundColor Yellow
+Write-Host "[3/4] Uploading file_scanner.php..." -ForegroundColor Yellow
 
 if (-not (Test-Path $SCAN_FILE)) {
     Write-Host "File not found: $SCAN_FILE" -ForegroundColor Red
     exit 1
 }
 
-$fileBytes = [System.IO.File]::ReadAllBytes($SCAN_FILE)
-$boundary  = "----FormBoundary" + [System.Guid]::NewGuid().ToString("N")
-$CRLF      = "`r`n"
+$uploadUri = "$BASE_URL/bitrix/admin/fileman_file_upload.php?action=upload&path=%2F&site_id=s1"
 
-$bodyParts = [System.Collections.Generic.List[byte]]::new()
+$uploadRespFile = Join-Path $env:TEMP "bx_upload.html"
 
-function Add-Field([string]$name, [string]$value) {
-    $part = "--$boundary$CRLF" +
-            "Content-Disposition: form-data; name=`"$name`"$CRLF$CRLF" +
-            "$value$CRLF"
-    $bodyParts.AddRange([System.Text.Encoding]::UTF8.GetBytes($part))
-}
+$result = & $curlExe -sk `
+    --cookie $COOKIE_JAR `
+    --cookie-jar $COOKIE_JAR `
+    --form "action=upload" `
+    --form "path=/" `
+    --form "site_id=s1" `
+    --form "sessid=$sessid" `
+    --form "file=@$SCAN_FILE;type=application/octet-stream" `
+    --output $uploadRespFile `
+    --write-out "%{http_code}" `
+    $uploadUri
 
-function Add-FileField([string]$name, [string]$filename, [byte[]]$data) {
-    $header = "--$boundary$CRLF" +
-              "Content-Disposition: form-data; name=`"$name`"; filename=`"$filename`"$CRLF" +
-              "Content-Type: application/octet-stream$CRLF$CRLF"
-    $bodyParts.AddRange([System.Text.Encoding]::UTF8.GetBytes($header))
-    $bodyParts.AddRange($data)
-    $bodyParts.AddRange([System.Text.Encoding]::UTF8.GetBytes($CRLF))
-}
-
-Add-Field "action"  "upload"
-Add-Field "path"    "/"
-Add-Field "site_id" "s1"
-Add-Field "sessid"  $sessid
-Add-FileField "file" "file_scanner.php" $fileBytes
-$bodyParts.AddRange([System.Text.Encoding]::UTF8.GetBytes("--$boundary--$CRLF"))
-
-$uploadUri = $BASE_URL + "/bitrix/admin/fileman_file_upload.php?action=upload" +
-             "&path=%2F&site_id=s1"
-
-try {
-    $uploadResp = Invoke-WebRequest `
-        -Uri $uploadUri `
-        -Method POST `
-        -Body $bodyParts.ToArray() `
-        -ContentType "multipart/form-data; boundary=$boundary" `
-        -WebSession $session `
-        -UseBasicParsing `
-        -TimeoutSec 30
-
-    if ($uploadResp.StatusCode -eq 200) {
-        Write-Host "    File uploaded." -ForegroundColor Green
-    } else {
-        Write-Host "    Upload status: $($uploadResp.StatusCode)" -ForegroundColor Yellow
-    }
-} catch {
-    Write-Host "    Upload via fileman failed: $_" -ForegroundColor Yellow
-    Write-Host "    Upload file_scanner.php manually via Bitrix file manager." -ForegroundColor Yellow
+if ($result -eq "200" -or $result -eq "302") {
+    Write-Host "    Uploaded. HTTP $result" -ForegroundColor Green
+} else {
+    Write-Host "    Upload HTTP $result - may need manual upload." -ForegroundColor Yellow
+    $uploadHtml = Get-Content $uploadRespFile -Raw -ErrorAction SilentlyContinue
+    if ($uploadHtml) { Write-Host "    Response: $($uploadHtml.Substring(0, [Math]::Min(300, $uploadHtml.Length)))" -ForegroundColor Gray }
+    Write-Host "    If upload failed - place file_scanner.php manually in site root via Bitrix file manager." -ForegroundColor Yellow
 }
 
 # -----------------------------------------------------------------------
-# Step 4. Run scan and save result
+# Step 4. Run scan
 # -----------------------------------------------------------------------
 Write-Host "[4/4] Running scan..." -ForegroundColor Yellow
 
-$scanUrl     = $BASE_URL + "/file_scanner.php?key=" + $SCAN_KEY
+$scanUrl     = "$BASE_URL/file_scanner.php?key=$SCAN_KEY"
 $scanUrlJson = $scanUrl + "&format=json"
+$resultFile  = Join-Path $PSScriptRoot "scan_result.json"
 
 Write-Host "    URL: $scanUrl" -ForegroundColor Gray
 
+$httpCode = & $curlExe -sk `
+    --cookie $COOKIE_JAR `
+    --output $resultFile `
+    --write-out "%{http_code}" `
+    --max-time 120 `
+    $scanUrlJson
+
+if ($httpCode -ne "200") {
+    Write-Host "Scan failed. HTTP $httpCode" -ForegroundColor Red
+    Write-Host "Make sure file_scanner.php is in the site root." -ForegroundColor Yellow
+    exit 1
+}
+
+# Open HTML version in browser
+Start-Process $scanUrl
+
+# Parse and display results
 try {
-    $scanResp = Invoke-WebRequest `
-        -Uri $scanUrlJson `
-        -WebSession $session `
-        -UseBasicParsing `
-        -TimeoutSec 120
-
-    $resultFile = Join-Path $PSScriptRoot "scan_result.json"
-    [System.IO.File]::WriteAllText($resultFile, $scanResp.Content, [System.Text.Encoding]::UTF8)
-
-    Start-Process $scanUrl
-
-    Write-Host "`n=== SCAN RESULT ===" -ForegroundColor Cyan
-    $json = $scanResp.Content | ConvertFrom-Json
+    $json = Get-Content $resultFile -Raw | ConvertFrom-Json
     $s = $json.stats
 
+    Write-Host "`n=== SCAN RESULT ===" -ForegroundColor Cyan
     Write-Host ("  Site root      : {0}" -f $json.root)
     Write-Host ("  Keep           : {0}" -f $s.KEEP)          -ForegroundColor Green
     Write-Host ("  Cache (delete) : {0}" -f $s.SAFE_DELETE)   -ForegroundColor Yellow
@@ -190,16 +153,20 @@ try {
     Write-Host ("  Can free up    : {0} MB" -f [math]::Round($s.deletable_size / 1MB, 2)) -ForegroundColor Magenta
 
     if ($s.danger_files -and $s.danger_files.Count -gt 0) {
-        Write-Host "`n  DANGER FILES:" -ForegroundColor Red
+        Write-Host "`n  DANGER FILES FOUND:" -ForegroundColor Red
         $s.danger_files | ForEach-Object { Write-Host "    - $_" -ForegroundColor Red }
     }
 
-    Write-Host "`n  JSON saved: $resultFile" -ForegroundColor Gray
-    Write-Host "  HTML opened in browser." -ForegroundColor Gray
+    Write-Host "`n  JSON saved to: $resultFile" -ForegroundColor Gray
+    Write-Host "  Full HTML report opened in browser." -ForegroundColor Gray
 
 } catch {
-    Write-Host "Scan failed: $_" -ForegroundColor Red
-    Write-Host "Make sure file_scanner.php is uploaded to the site root." -ForegroundColor Yellow
+    Write-Host "Could not parse JSON result: $_" -ForegroundColor Yellow
+    Write-Host "Raw output saved to: $resultFile" -ForegroundColor Gray
+    Start-Process $scanUrl
 }
 
-Write-Host "`n[!] Remember to DELETE file_scanner.php from server after analysis!" -ForegroundColor Red
+Write-Host "`n[!] DELETE file_scanner.php from server after analysis!" -ForegroundColor Red
+
+# Cleanup temp files
+Remove-Item $loginPageFile, $authRespFile, $uploadRespFile -ErrorAction SilentlyContinue
